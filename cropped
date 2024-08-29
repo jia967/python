@@ -1,0 +1,45 @@
+import cv2
+import os
+
+# 定义原始图像文件夹路径和目标裁剪图像文件夹路径
+folder = 'C:\\pycharmproject\\train'
+dest_folder = 'C:\\pycharmproject\\cropped'
+
+# 如果目标文件夹不存在，则创建该文件夹
+if not os.path.exists(dest_folder):
+    os.makedirs(dest_folder)
+
+# 定义裁剪图像的大小（patch size）和步长（stride）
+patchsize = 256
+stride = 256
+
+# 初始化计数器，用于命名保存的裁剪图像文件
+count = 1
+
+# 遍历原始图像文件夹中的所有图像文件
+for img_n in sorted(os.listdir(folder)):
+    # 读取当前图像文件
+    img = cv2.imread(os.path.join(folder, img_n))
+    # 获取图像的高度（h）和宽度（w）
+    h, w, _ = img.shape
+    # 计算垂直和水平方向可以裁剪的图像块数量
+    h_number = h // patchsize
+    w_number = w // patchsize
+    # 在垂直方向和水平方向上遍历每一个图像块
+    for i in range(h_number):
+        for j in range(w_number):
+            # 计算当前图像块的左上角和右下角的像素位置
+            start_ij_l = j * stride
+            start_ij_u = i * stride
+            end_ij_l = start_ij_l + stride
+            end_ij_u = start_ij_u + stride
+            # 从原始图像中裁剪出当前图像块
+            img_crop = img[start_ij_u:end_ij_u, start_ij_l:end_ij_l]
+            # 将裁剪的图像块保存到目标文件夹中，并以顺序编号命名
+            cv2.imwrite(os.path.join(dest_folder, '{:0>6d}.png'.format(count)), img_crop)
+            # 计数器加一
+            count += 1
+
+# 输出处理完成的消息
+print("{} done!".format(folder))
+
