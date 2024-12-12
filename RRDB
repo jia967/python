@@ -1,0 +1,137 @@
+import functools
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# 创建指定层数的网络层
+def make_layer(block, n_layers):
+    layers = []
+    for _ in range(n_layers):
+        layers.append(block())  # 使用指定的block创建层
+    return nn.Sequential(*layers)  # 将层转化为nn.Sequential形式
+
+
+# 定义一个残差密集块，包含5个卷积层
+class ResidualDenseBlock_5C(nn.Module):
+    def __init__(self, nf=64, gc=32, bias=True):
+        super(ResidualDenseBlock_5C, self).__init__()
+        # nf: 输入特征通道数，gc: 增长通道数，bias: 是否使用偏置
+        self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1, bias=bias)  # 第一层卷积
+        self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1, bias=bias)  # 第二层卷积
+        self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)  # 第三层卷积
+        self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1, bias=bias)  # 第四层卷积
+        self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1, bias=bias)  # 第五层卷积
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)  # LeakyReLU激活函数
+
+        self.init_weights()  # 初始化权重
+
+    # 初始化卷积层的权重
+    def init_weights(self):
+        """为ResidualDenseBlock初始化权重，使用较小的标准差提高稳定性和性能"""
+        for i in range(5):
+            default_init_weights(getattr(self, f'conv{i+1}'), 0.1)  # 依次初始化每一层卷积的权重
+
+    # 前向传播函数
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))  # 第一层卷积+激活
+        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))  # 将输入和x1拼接后进行第二层卷积+激活
+        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))  # 将输入、x1、x2拼接后进行第三层卷积+激活
+        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))  # 同理拼接并进行第四层卷积+激活
+        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))  # 拼接后进行第五层卷积
+        return x5 * 0.2 + x  # 输出为x5乘以缩放系数0.2后加上输入x
+
+
+# 用于初始化网络权重的函数
+def default_init_weights(module, scale=1):
+    """初始化网络权重"""
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d):  # 如果是卷积层
+            nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in', nonlinearity='relu')  # Kaiming初始化
+            m.weight.data *= scale  # 权重乘以scale缩放系数
+        elif isinstance(m, nn.Linear):  # 如果是全连接层
+            nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in', nonlinearity='relu')  # 同样进行Kaiming初始化
+            m.weight.data *= scale  # 乘以scale缩放系数
+
+
+# 定义RRDB（Residual-in-Residual Dense Block）模块，包含3个ResidualDenseBlock_5C块
+class RRDB(nn.Module):
+    '''Residual in Residual Dense Block'''
+
+    def __init__(self, nf=64, gc=32):
+        super(RRDB, self).__init__()
+        # 三个连续的ResidualDenseBlock_5C模块
+        self.RDB1 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB2 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB3 = ResidualDenseBlock_5C(nf, gc)
+
+    # 前向传播
+    def forward(self, x):
+        out = self.RDB1(x)  # 第一个ResidualDenseBlock的输出
+        out = self.RDB2(out)  # 第二个ResidualDenseBlock的输出
+        out = self.RDB3(out)  # 第三个ResidualDenseBlock的输出
+        return out * 0.2 + x  # 残差连接，将输出乘以0.2再加上输入
+
+
+# 定义RRDBNet网络
+class RRDBNet(nn.Module):
+    def __init__(self, in_nc, out_nc, nf=64, nb=23, gc=32):
+        super(RRDBNet, self).__init__()
+        # 使用functools.partial固定RRDB的参数
+        RRDB_block_f = functools.partial(RRDB, nf=nf, gc=gc)
+
+        # 第一层卷积，将输入通道数映射到nf
+        self.conv_first = nn.Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+        # 由多个RRDB块组成的主干网络
+        self.RRDB_trunk = make_layer(RRDB_block_f, nb)
+        # 主干网络后的卷积层
+        self.trunk_conv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        # 高分辨率卷积层和最后输出层
+        self.HRconv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+
+        # LeakyReLU激活函数
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+    # 前向传播
+    def forward(self, x):
+        fea = self.conv_first(x)  # 第一层卷积
+        trunk = self.trunk_conv(self.RRDB_trunk(fea))  # 主干网络
+        fea = fea + trunk  # 残差连接
+        out = self.conv_last(self.lrelu(self.HRconv(fea)))  # 卷积、激活及最后输出
+        return out
+
+
+# RRDBNetX4：带有上采样模块的RRDBNet网络，用于超分辨率
+class RRDBNetX4(nn.Module):
+    def __init__(self, in_nc, out_nc, nf=64, nb=23, gc=32):
+        super(RRDBNetX4, self).__init__()
+        # RRDB块的定义，与RRDBNet相同
+        RRDB_block_f = functools.partial(RRDB, nf=nf, gc=gc)
+
+        # 输入卷积层
+        self.conv_first = nn.Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+        # 主干RRDB块
+        self.RRDB_trunk = make_layer(RRDB_block_f, nb)
+        # 主干网络后的卷积层
+        self.trunk_conv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        # 两层上采样卷积
+        self.upconv1 = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.upconv2 = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        # 高分辨率卷积层和最后输出层
+        self.HRconv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+
+        # LeakyReLU激活函数
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+    # 前向传播
+    def forward(self, x):
+        fea = self.conv_first(x)  # 输入卷积
+        trunk = self.trunk_conv(self.RRDB_trunk(fea))  # 主干网络
+        fea = fea + trunk  # 残差连接
+        # 上采样过程，采用最近邻插值后卷积
+        fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        out = self.conv_last(self.lrelu(self.HRconv(fea)))  # 最终卷积和输出
+        return out
